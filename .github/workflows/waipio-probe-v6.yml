@@ -1,0 +1,114 @@
+name: 5.10 waipio build probe v6
+
+# v5 结论: clang bin 定位已正确(/tmp/clang/bin); 但 clang.real 缺 libc++.so.1
+#   -> v4/v5 用 cp -a bin/. 只搬了可执行文件, 没带 lib64/ 里的库
+# v6: 改为软链接整棵 clang 树(保留相对路径), 并从实际位置推导 LD_LIBRARY_PATH
+
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        description: 'BUILD_CONFIG path'
+        required: false
+        default: 'msm-kernel/build.config.msm.waipio'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    continue-on-error: true
+
+    env:
+      KERNEL_REPO: https://github.com/OnePlusOSS/android_kernel_oneplus_sm8450
+      KERNEL_REF: oneplus/sm8450_b_16.0_oneplus_10_pro
+      COMMON_REPO: https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8450
+      COMMON_REF: oneplus/sm8450_s_12.1_10_pro
+      MODULES_REPO: https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8450
+      MODULES_REF: oneplus/sm8450_b_16.0_oneplus_10_pro
+      WS: ${{ github.workspace }}/ws
+      BUILD_CONFIG_PATH: ${{ github.event.inputs.config }}
+      HERMETIC_TOOLCHAIN: '0'
+      LTO: 'thin'
+
+    steps:
+      - name: Install cross compilers + deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-arm-linux-gnueabi gcc-aarch64-linux-gnu \
+            bison flex libssl-dev bc zip cpio kmod libelf-dev python3
+
+      - name: Fetch clang
+        run: |
+          set -e
+          mkdir -p /tmp/clang && cd /tmp/clang
+          curl -fL --retry 3 -o clang.tar.gz \
+            "https://github.com/Rancemxn/android_kernel_oppo_sm7325/releases/download/BuildTool/linux-x86-refs_heads_llvm-r383902b-clang-r383902.tar.gz"
+          tar -xzf clang.tar.gz
+          rm -f clang.tar.gz
+
+          CLANG_EXE=$(find /tmp/clang -maxdepth 6 -name clang \( -type f -o -type l \) | head -1)
+          BINDIR=$(dirname "$CLANG_EXE")
+          echo "CLANG_BIN=$BINDIR" >> $GITHUB_ENV
+          echo "CLANG_ROOT=$(dirname $BINDIR)" >> $GITHUB_ENV
+
+          LIBDIR=$(find /tmp/clang -maxdepth 4 -name 'libc++.so*' | head -1)
+          LIBDIR=$(dirname "$LIBDIR")
+          echo "CLANG_LIBDIR=$LIBDIR" >> $GITHUB_ENV
+          echo "clang bin=$BINDIR  libdir=$LIBDIR"
+
+          ls "$LIBDIR" | grep -i 'libc++' | head -5 || true
+          "$BINDIR/clang" --version | head -2
+
+      - name: Clone sources
+        run: |
+          set -e
+          mkdir -p "$WS/kernel_platform"
+          git clone --depth 1 -b "$KERNEL_REF"  "$KERNEL_REPO"  "$WS/kernel_platform/msm-kernel"
+          git clone --depth 1 -b "$COMMON_REF"  "$COMMON_REPO"  "$WS/kernel_platform/common"
+          git clone --depth 1 -b "$MODULES_REF" "$MODULES_REPO" /tmp/modules
+          cp -a /tmp/modules/kernel_platform/. "$WS/kernel_platform/" 2>/dev/null || true
+          [ -d /tmp/modules/vendor ] && cp -a /tmp/modules/vendor "$WS/vendor" || true
+          rm -rf /tmp/modules
+          df -h /
+
+      - name: Stage clang by symlinking the whole tree
+        run: |
+          set -e
+          D="$WS/kernel_platform/prebuilts-master/clang/host/linux-x86/clang-r416183b"
+          mkdir -p "$(dirname "$D")"
+          rm -rf "$D"
+          ln -sfn "$CLANG_ROOT" "$D"
+          echo "symlink: $D -> $(readlink "$D")"
+          echo "LD_LIBRARY_PATH=$CLANG_LIBDIR:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          "$D/bin/clang" --version | head -2
+          echo "--- 确认 clang.real 能跑 ---"
+          "$D/bin/clang" -x c -c /dev/null -o /tmp/t.o && echo "OK: clang works" || echo "FAIL: clang broken"
+
+      - name: Build
+        run: |
+          set -o pipefail
+          cd "$WS/kernel_platform"
+          echo "PWD=$(pwd)  BUILD_CONFIG=$BUILD_CONFIG_PATH  LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+          ( BUILD_CONFIG="$BUILD_CONFIG_PATH" build/build.sh -j$(nproc) 2>&1 ) | tee /tmp/build.log
+          echo "BUILD_EXIT=${PIPESTATUS[0]}"
+        continue-on-error: true
+
+      - name: Report
+        if: always()
+        run: |
+          echo "===== key lines ====="
+          grep -nE 'command not found|No such file or directory|Error [0-9]|error:|fatal error|Kernel: arch' /tmp/build.log 2>/dev/null | tail -40 || echo "(none)"
+          echo "===== artifacts ====="
+          find "$WS/kernel_platform/out" -maxdepth 7 \( -name 'Image' -o -name 'vmlinux' -o -name 'Image.gz' \) 2>/dev/null | head -20 || echo "(none)"
+          echo "===== lines ====="
+          wc -l < /tmp/build.log 2>/dev/null || echo 0
+          echo "===== tail 25 ====="
+          tail -25 /tmp/build.log 2>/dev/null || true
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: waipio-build-log-v6
+          path: /tmp/build.log
+          if-no-files-found: warn
