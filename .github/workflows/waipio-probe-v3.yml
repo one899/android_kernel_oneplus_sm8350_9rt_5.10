@@ -1,0 +1,87 @@
+name: 5.10 waipio build probe v3
+
+# v1: 布局正确(symlink 全解析) / msm-kernel 5.10.236 / 发现 build.config.msm.lahaina
+# v2: 定位失败原因 —— common/build.config.common 里 HERMETIC_TOOLCHAIN 默认为 1,
+#     触发 _setup_env.sh 的 "PATH=<HOST_TOOLS>" 赋值, 把 PATH 整个替换成只含
+#     bash/git/perl/rsync/sh/tar 六个软链的目录; 而 build.sh 自己要用
+#     nproc / readlink / sed / tr —— 于是 exit 127.
+#
+# v3: 双保险
+#   A. HERMETIC_TOOLCHAIN=0 绕开那段 PATH 替换 (该文件用的是 \${VAR:-1}, 可被环境覆盖)
+#   B. 同时导出 ADDITIONAL_HOST_TOOLS, 万一 hermetic 仍为 1, 也把缺的工具补进软链列表
+
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        description: 'BUILD_CONFIG path (relative to ws/kernel_platform)'
+        required: false
+        default: 'msm-kernel/build.config.msm.waipio'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    continue-on-error: true
+
+    env:
+      KERNEL_REPO: https://github.com/OnePlusOSS/android_kernel_oneplus_sm8450
+      KERNEL_REF: oneplus/sm8450_b_16.0_oneplus_10_pro
+      COMMON_REPO: https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8450
+      COMMON_REF: oneplus/sm8450_s_12.1_10_pro
+      MODULES_REPO: https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8450
+      MODULES_REF: oneplus/sm8450_b_16.0_oneplus_10_pro
+      WS: ${{ github.workspace }}/ws
+      BUILD_CONFIG_PATH: ${{ github.event.inputs.config }}
+      HERMETIC_TOOLCHAIN: '0'
+      ADDITIONAL_HOST_TOOLS: 'nproc readlink realpath sed tr grep awk find xargs cut head tail wc sort uniq date dirname basename env tee md5sum sha1sum sha256sum diff patch cmp file stat touch chmod ln cp mv rm mkdir sleep which id expr printf od strings nm objdump readelf strip python3'
+      LTO: 'thin'
+
+    steps:
+      - name: Clone all sources
+        run: |
+          set -e
+          mkdir -p "$WS/kernel_platform"
+          git clone --depth 1 -b "$KERNEL_REF"  "$KERNEL_REPO"  "$WS/kernel_platform/msm-kernel"
+          git clone --depth 1 -b "$COMMON_REF"  "$COMMON_REPO"  "$WS/kernel_platform/common"
+          git clone --depth 1 -b "$MODULES_REF" "$MODULES_REPO" /tmp/modules
+          cp -a /tmp/modules/kernel_platform/. "$WS/kernel_platform/" 2>/dev/null || true
+          [ -d /tmp/modules/vendor ] && cp -a /tmp/modules/vendor "$WS/vendor" || true
+          rm -rf /tmp/modules
+          df -h /
+
+      - name: Pre-flight tool check
+        run: |
+          echo "PATH=$PATH"
+          for t in nproc readlink sed tr; do
+            printf '%-10s -> %s\n' "$t" "$(command -v $t || echo MISSING)"
+          done
+
+      - name: Build
+        run: |
+          set -o pipefail
+          cd "$WS/kernel_platform"
+          echo "PWD=$(pwd)  BUILD_CONFIG=$BUILD_CONFIG_PATH  HERMETIC_TOOLCHAIN=$HERMETIC_TOOLCHAIN"
+          ( BUILD_CONFIG="$BUILD_CONFIG_PATH" build/build.sh -j$(nproc) 2>&1 ) | tee /tmp/build.log
+          echo "BUILD_EXIT=${PIPESTATUS[0]}"
+        continue-on-error: true
+
+      - name: Report
+        if: always()
+        run: |
+          echo "===== key lines ====="
+          grep -nE 'PATH=|command not found|Error|error:|fatal|Kernel: arch|Image' /tmp/build.log 2>/dev/null | tail -50 || echo "(none)"
+          echo
+          echo "===== artifacts ====="
+          find "$WS/kernel_platform/out" -maxdepth 5 \( -name 'Image' -o -name 'Image.gz' -o -name 'vmlinux' \) 2>/dev/null | head -20 || true
+          echo "===== stats ====="
+          echo "build.log lines: $(wc -l < /tmp/build.log 2>/dev/null || echo 0)"
+          tail -40 /tmp/build.log 2>/dev/null || true
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: waipio-build-log-v3
+          path: /tmp/build.log
+          if-no-files-found: warn
