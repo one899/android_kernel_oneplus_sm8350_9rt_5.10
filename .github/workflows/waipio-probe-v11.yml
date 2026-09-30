@@ -1,0 +1,127 @@
+name: 5.10 waipio build probe v11
+
+# v10 结论: clang 正确(clang 12.0.5) / GKI 阶段 Image+vmlinux / error:0
+#   vendor 阶段 defconfig 合并成功, 但死在 sanity_check_abi 的 diff:
+#     "Suspected ABI differences between msm-waipio and GKI kernel tree"
+#
+#   根因: common 用的是 oneplus/sm8450_s_12.1_10_pro (5.10.66)
+#         msm-kernel 用的是 oneplus/sm8450_b_16.0_oneplus_10_pro (5.10.236)
+#         两个分支来自不同 OPLUS 版本, ABI XML 必然不一致
+#   修复: common 改用同名分支 oneplus/sm8450_b_16.0_oneplus_10_pro
+
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        required: false
+        default: 'msm-kernel/build.config.msm.waipio'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    continue-on-error: true
+
+    env:
+      KERNEL_REPO: https://github.com/one899/android_kernel_oneplus_sm8450_5.10_martini
+      KERNEL_REF: oneplus/sm8450_b_16.0_oneplus_10_pro
+      COMMON_REPO: https://github.com/one899/android_kernel_common_oneplus_sm8450_5.10_martini
+      COMMON_REF: oneplus/sm8450_b_16.0_oneplus_10_pro
+      MODULES_REPO: https://github.com/one899/android_kernel_modules_and_devicetree_sm8450_5.10_martini
+      MODULES_REF: oneplus/sm8450_b_16.0_oneplus_10_pro
+      DTC_REPO: https://git.codelinaro.org/clo/la/kernel_platform/external/dtc.git
+      DTC_REF: KERNEL.PLATFORM.1.0.c27
+      WS: ${{ github.workspace }}/ws
+      BUILD_CONFIG_PATH: ${{ github.event.inputs.config }}
+      HERMETIC_TOOLCHAIN: '0'
+      LTO: 'thin'
+
+    steps:
+      - name: Install deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-arm-linux-gnueabi gcc-aarch64-linux-gnu \
+            bison flex libssl-dev bc zip cpio kmod libelf-dev python3 pkg-config
+
+      - name: Fetch clang-r416183b
+        run: |
+          set -e
+          CLANG_OK=0
+          ARCH_BASE="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads"
+          mkdir -p /tmp/aosp
+          for BR in android-gs-raviole-5.10-android12-d1 android-gs-raviole-5.10-android12-qpr3 main; do
+            if curl -fL --retry 2 -m 900 -o /tmp/aosp/c.tar.gz "$ARCH_BASE/$BR/clang-r416183b.tar.gz" 2>/dev/null; then
+              SZ=$(stat -c%s /tmp/aosp/c.tar.gz 2>/dev/null || echo 0)
+              if [ "$SZ" -gt 1000000 ]; then
+                mkdir -p /tmp/aosp/x && tar -xzf /tmp/aosp/c.tar.gz -C /tmp/aosp/x
+                if [ -x /tmp/aosp/x/bin/clang ]; then echo "CLANG_ROOT=/tmp/aosp/x" >> $GITHUB_ENV; CLANG_OK=1; echo "OK from $BR"; break; fi
+              fi
+            fi
+          done
+          [ "$CLANG_OK" = "1" ] || { echo "CLANG_ROOT=SYSTEM" >> $GITHUB_ENV; echo "fallback"; }
+          echo "CLANG_OK=$CLANG_OK"
+
+      - name: Clone sources (same release) + external/dtc
+        run: |
+          set -e
+          mkdir -p "$WS/kernel_platform"
+          git clone --depth 1 -b "$KERNEL_REF"  "$KERNEL_REPO"  "$WS/kernel_platform/msm-kernel"
+          git clone --depth 1 -b "$COMMON_REF"  "$COMMON_REPO"  "$WS/kernel_platform/common"
+          git clone --depth 1 -b "$MODULES_REF" "$MODULES_REPO" /tmp/modules
+          cp -a /tmp/modules/kernel_platform/. "$WS/kernel_platform/" 2>/dev/null || true
+          [ -d /tmp/modules/vendor ] && cp -a /tmp/modules/vendor "$WS/vendor" || true
+          rm -rf /tmp/modules
+          git clone --depth 1 -b "$DTC_REF" "$DTC_REPO" "$WS/kernel_platform/external/dtc"
+          echo "--- ABI 文件对比 ---"
+          md5sum "$WS/kernel_platform/msm-kernel/android/abi_gki_aarch64.xml" \
+                 "$WS/kernel_platform/common/android/abi_gki_aarch64.xml" 2>/dev/null || echo "(missing)"
+          df -h /
+
+      - name: Stage clang
+        run: |
+          set -e
+          D="$WS/kernel_platform/prebuilts-master/clang/host/linux-x86/clang-r416183b"
+          mkdir -p "$(dirname "$D")"; rm -rf "$D"
+          if [ "$CLANG_ROOT" != "SYSTEM" ]; then ln -sfn "$CLANG_ROOT" "$D"; else
+            mkdir -p "$D"
+            for t in clang clang++ ld.lld llvm-ar llvm-as llvm-nm llvm-objcopy llvm-objdump llvm-strip; do
+              p=$(command -v $t 2>/dev/null || true); [ -n "$p" ] && ln -sf "$p" "$D/$t"
+            done
+          fi
+          "$D/bin/clang" --version | head -1
+          WRAPDIR="$WS/kernel_platform/build/build-tools/path/linux-x86"
+          if [ ! -d "$WS/kernel_platform/prebuilts/build-tools/linux-x86/bin" ]; then
+            grep -rl 'prebuilts/build-tools' "$WRAPDIR" 2>/dev/null | while read -r f; do rm -f "$f"; done
+          fi
+
+      - name: Build
+        run: |
+          set -o pipefail
+          cd "$WS/kernel_platform"
+          ( BUILD_CONFIG="$BUILD_CONFIG_PATH" build/build.sh -j$(nproc) 2>&1 ) | tee /tmp/build.log
+          echo "BUILD_EXIT=${PIPESTATUS[0]}"
+        continue-on-error: true
+
+      - name: Report
+        if: always()
+        run: |
+          echo "===== error types ====="
+          grep -oE 'error: [^,]*' /tmp/build.log 2>/dev/null | sort | uniq -c | sort -rn | head -10 || true
+          echo "===== counts ====="
+          for k in 'CC ' 'LD ' 'AR ' 'DTBS' 'error:' 'Suspected ABI'; do printf '%-16s %s\n' "$k" "$(grep -cF "$k" /tmp/build.log 2>/dev/null || echo 0)"; done
+          echo "===== make errors ====="
+          grep -nE 'make.*\*\*\*|Suspected ABI|Are trees in sync' /tmp/build.log 2>/dev/null | tail -10 || echo "(none)"
+          echo "===== artifacts ====="
+          find "$WS/kernel_platform/out" -maxdepth 8 \( -name 'Image' -o -name 'vmlinux' -o -name '*.dtb' -o -name 'vendor_dlkm.img' -o -name 'Module.symvers' \) 2>/dev/null | head -25 || echo "(none)"
+          echo "===== dist ====="
+          ls -la "$WS/kernel_platform/out/msm-waipio-waipio-consolidate/dist" 2>/dev/null | head -25 || echo "(no dist)"
+          echo "===== tail 15 ====="
+          tail -15 /tmp/build.log 2>/dev/null || true
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: waipio-build-log-v11
+          path: /tmp/build.log
+          if-no-files-found: warn
