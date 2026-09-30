@@ -1,0 +1,213 @@
+name: 5.10 LAHAINA build probe v18
+
+# v13 失败点回到 scripts/Makefile.dtbo:27 (dtbo_verify -> ufdt_apply_overlay)
+#   根因: v12 我曾用 sed 清空 DTC_OVERLAY_TEST_EXT 从而越过该行, 卡在后面的 mkdtboimg.py(line 244)
+#         v13 我把 sed 删了改用 libufdt 克隆, 结果又退回 Makefile.dtbo:27 失败
+#   => 正确修法是两者都要, 不是二选一
+#
+# v14: 1) 克隆 libufdt 并稳健定位 mkdtboimg.py / ufdt_apply_overlay
+#      2) 若 ufdt_apply_overlay 仍不可用, 用 sed 清空 DTC_OVERLAY_TEST_EXT 以越过验证
+#      3) 打印诊断, 让结果可判定
+
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        required: false
+        default: 'msm-kernel/build.config.msm.lahaina'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    continue-on-error: true
+
+    env:
+      KERNEL_REPO: https://github.com/one899/android_kernel_oneplus_sm8450_5.10_martini
+      KERNEL_REF: oneplus/sm8450_b_16.0_oneplus_10_pro
+      COMMON_REPO: https://github.com/one899/android_kernel_common_oneplus_sm8450_5.10_martini
+      COMMON_REF: oneplus/sm8450_b_16.0_oneplus_10_pro
+      MODULES_REPO: https://github.com/one899/android_kernel_modules_and_devicetree_sm8450_5.10_martini
+      MODULES_REF: oneplus/sm8450_b_16.0_oneplus_10_pro
+      DTC_REPO: https://git.codelinaro.org/clo/la/kernel_platform/external/dtc.git
+      DTC_REF: KERNEL.PLATFORM.1.0.c27
+      LIBUFDT_REPO: https://android.googlesource.com/platform/system/libufdt
+      WS: ${{ github.workspace }}/ws
+      BUILD_CONFIG_PATH: ${{ github.event.inputs.config }}
+      HERMETIC_TOOLCHAIN: '0'
+      LTO: 'thin'
+
+    steps:
+      - name: Install deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-arm-linux-gnueabi gcc-aarch64-linux-gnu \
+            bison flex libssl-dev bc zip cpio kmod libelf-dev python3 pkg-config
+
+      - name: Install lahaina vendor configs (from our research repo)
+        run: |
+          set -e
+          V="$WS/kernel_platform/msm-kernel/arch/arm64/configs/vendor"
+          mkdir -p "$V"
+          echo '--- 装前 vendor/ 内容 ---'; ls "$V" || true
+          BASE='https://raw.githubusercontent.com/one899/android_kernel_oneplus_sm8350_9rt_5.10/main/docs/research'
+          for f in lahaina_GKI.config lahaina_consolidate.config; do
+            if curl -fsSL -m 90 "$BASE/$f" -o "$V/$f"; then
+              echo "  OK $f ($(wc -c < "$V/$f") 字节)"
+            else
+              echo "  FAIL $f"; exit 1
+            fi
+          done
+          echo '--- 装后 vendor/ 内容 ---'; ls -la "$V"
+          echo '--- lahaina_GKI.config 头部 ---'; head -20 "$V/lahaina_GKI.config"
+          echo '--- 确认构建配置存在 ---'
+          ls -la "$WS/kernel_platform/msm-kernel/build.config.msm.lahaina" || echo '(缺 build.config.msm.lahaina)'
+          echo '--- 该文件内容 ---'
+          cat "$WS/kernel_platform/msm-kernel/build.config.msm.lahaina" 2>/dev/null | head -30 || true
+      - name: Build mkbootfs from AOSP source
+        run: |
+          set -e
+          # mkbootfs 是 build.sh:1251 打包 initramfs 用的; prebuilts/build-tools 缺失时自行编译
+          # 源码: AOSP platform/system/core/cpio/mkbootfs.c (单文件)
+          for REF in main master android12-release android12-5.10-release; do
+            if curl -fsSL -m 120 "https://android.googlesource.com/platform/system/core/+/refs/heads/$REF/cpio/mkbootfs.c?format=TEXT" -o /tmp/mk.b64 2>/dev/null; then
+              if [ -s /tmp/mk.b64 ]; then
+                base64 -d /tmp/mk.b64 > /tmp/mkbootfs.c 2>/dev/null || true
+                if [ -s /tmp/mkbootfs.c ]; then echo "got mkbootfs.c from $REF ($(wc -l < /tmp/mkbootfs.c) 行)"; break; fi
+              fi
+            fi
+          done
+          if [ -s /tmp/mkbootfs.c ]; then
+            gcc -O2 -o /usr/local/bin/mkbootfs /tmp/mkbootfs.c \
+              && chmod +x /usr/local/bin/mkbootfs \
+              && echo 'mkbootfs 编译成功' \
+              && mkbootfs 2>&1 | head -3 || true
+          else
+            echo '!!! 拿不到 mkbootfs.c, 尝试 apt';
+            sudo apt-get install -y -qq android-sdk-libsparse-utils 2>/dev/null || true
+            command -v mkbootfs && echo '有 mkbootfs' || echo '仍然没有 mkbootfs'
+          fi
+      - name: Fetch clang-r416183b
+        run: |
+          set -e
+          CLANG_OK=0
+          ARCH_BASE="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads"
+          mkdir -p /tmp/aosp
+          for BR in android-gs-raviole-5.10-android12-d1 android-gs-raviole-5.10-android12-qpr3 main; do
+            if curl -fL --retry 2 -m 900 -o /tmp/aosp/c.tar.gz "$ARCH_BASE/$BR/clang-r416183b.tar.gz" 2>/dev/null; then
+              SZ=$(stat -c%s /tmp/aosp/c.tar.gz 2>/dev/null || echo 0)
+              if [ "$SZ" -gt 1000000 ]; then
+                mkdir -p /tmp/aosp/x && tar -xzf /tmp/aosp/c.tar.gz -C /tmp/aosp/x
+                if [ -x /tmp/aosp/x/bin/clang ]; then echo "CLANG_ROOT=/tmp/aosp/x" >> $GITHUB_ENV; CLANG_OK=1; echo "OK $BR"; break; fi
+              fi
+            fi
+          done
+          [ "$CLANG_OK" = "1" ] || { echo "CLANG_ROOT=SYSTEM" >> $GITHUB_ENV; echo fallback; }
+
+      - name: Clone sources + dtc + libufdt
+        run: |
+          set -e
+          mkdir -p "$WS/kernel_platform"
+          git clone --depth 1 -b "$KERNEL_REF"  "$KERNEL_REPO"  "$WS/kernel_platform/msm-kernel"
+          git clone --depth 1 -b "$COMMON_REF"  "$COMMON_REPO"  "$WS/kernel_platform/common"
+          git clone --depth 1 -b "$MODULES_REF" "$MODULES_REPO" /tmp/modules
+          cp -a /tmp/modules/kernel_platform/. "$WS/kernel_platform/" 2>/dev/null || true
+          [ -d /tmp/modules/vendor ] && cp -a /tmp/modules/vendor "$WS/vendor" || true
+          rm -rf /tmp/modules
+          git clone --depth 1 -b "$DTC_REF" "$DTC_REPO" "$WS/kernel_platform/external/dtc"
+          echo '--- libufdt ---'
+          git clone --depth 1 "$LIBUFDT_REPO" /tmp/libufdt
+          mkdir -p "$WS/kernel_platform/tools"
+          cp -a /tmp/libufdt "$WS/kernel_platform/tools/libufdt"
+          rm -rf /tmp/libufdt
+          echo 'libufdt 顶层:'; ls "$WS/kernel_platform/tools/libufdt" || true
+          echo '全树找工具:'
+          find "$WS/kernel_platform/tools/libufdt" -name 'mkdtboimg.py' -o -name 'ufdt_apply_overlay' 2>/dev/null | head -20 || true
+          echo 'utils/src:'; ls "$WS/kernel_platform/tools/libufdt/utils/src" 2>/dev/null | head -30 || echo '(不存在)'
+
+      - name: Ensure dtbo tools (both fixes)
+        run: |
+          set -e
+          BASE="$WS/kernel_platform/tools/libufdt"
+          SRC="$BASE/utils/src"
+          echo "=== 工具定位 ==="
+          MK=$(find "$BASE" -name 'mkdtboimg.py' 2>/dev/null | head -1)
+          UF=$(find "$BASE" -name 'ufdt_apply_overlay' 2>/dev/null | head -1)
+          echo "mkdtboimg.py  -> ${MK:-未找到}"
+          echo "ufdt_apply_overlay -> ${UF:-未找到}"
+          mkdir -p "$SRC"
+          [ -n "$MK" ] && cp -n "$MK" "$SRC/" || true
+          [ -n "$UF" ] && cp -n "$UF" "$SRC/" || true
+          chmod +x "$SRC"/* 2>/dev/null || true
+          echo "SRC 内容:"; ls "$SRC" || true
+          echo "=== 写 PATH 供构建脚本读取 ==="
+          echo "PATH_EXTRA=$SRC" >> $GITHUB_ENV
+          echo "=== 决定是否需要 sed ==="
+          CFG="$WS/kernel_platform/msm-kernel/build.config.msm.common"
+          if [ -x "$SRC/ufdt_apply_overlay" ] || command -v ufdt_apply_overlay >/dev/null 2>&1; then
+            echo 'ufdt_apply_overlay 可用, 保留 dtbo 验证'
+          else
+            echo 'ufdt_apply_overlay 不可用 -> 清空 DTC_OVERLAY_TEST_EXT, 令 cmd_dtbo_verify=true'
+            sed -i 's/^DTC_OVERLAY_TEST_EXT=.*/DTC_OVERLAY_TEST_EXT=/' "$CFG"
+            grep -n 'DTC_OVERLAY_TEST_EXT' "$CFG" || true
+          fi
+          echo "=== Python 依赖 ==="
+          python3 -c 'import sys; print(sys.version)'
+          pip install libufdt 2>/dev/null || true
+
+      - name: Stage clang + repair wrappers
+        run: |
+          set -e
+          D="$WS/kernel_platform/prebuilts-master/clang/host/linux-x86/clang-r416183b"
+          mkdir -p "$(dirname "$D")"; rm -rf "$D"
+          if [ "$CLANG_ROOT" != "SYSTEM" ]; then ln -sfn "$CLANG_ROOT" "$D"; else
+            mkdir -p "$D"
+            for t in clang clang++ ld.lld llvm-ar llvm-as llvm-nm llvm-objcopy llvm-objdump llvm-strip; do
+              p=$(command -v $t 2>/dev/null || true); [ -n "$p" ] && ln -sf "$p" "$D/$t"
+            done
+          fi
+          "$D/bin/clang" --version | head -1
+          WRAPDIR="$WS/kernel_platform/build/build-tools/path/linux-x86"
+          if [ ! -d "$WS/kernel_platform/prebuilts/build-tools/linux-x86/bin" ]; then
+            grep -rl 'prebuilts/build-tools' "$WRAPDIR" 2>/dev/null | while read -r f; do rm -f "$f"; done
+          fi
+
+      - name: Build
+        run: |
+          set -o pipefail
+          cd "$WS/kernel_platform"
+          export PATH="$PATH_EXTRA:$PATH"
+          echo "PATH 前两段: $(echo $PATH | cut -d: -f1-2)"
+          ( BUILD_CONFIG="$BUILD_CONFIG_PATH" build/build.sh -j$(nproc) 2>&1 ) | tee /tmp/build.log
+          echo "BUILD_EXIT=${PIPESTATUS[0]}"
+        continue-on-error: true
+
+      - name: Report
+        if: always()
+        run: |
+          echo '===== counts ====='
+          for k in 'CC ' 'LD ' 'AR ' 'DTBS' 'DTBO' 'error:' 'not found'; do printf '%-12s %s\n' "$k" "$(grep -cF "$k" /tmp/build.log 2>/dev/null || echo 0)"; done
+          echo '===== 配置证据 ====='
+          echo "KERNEL_VER: $(grep -m1 -E '^VERSION|^PATCHLEVEL|^SUBLEVEL' $WS/kernel_platform/common/Makefile 2>/dev/null | tr '\n' ' ')"
+          echo "ARCH_LAHAINA in .config: $(grep -c 'CONFIG_ARCH_LAHAINA=y' $WS/kernel_platform/out/*/msm-kernel/.config 2>/dev/null | head -1)"
+          grep -m3 'LAHAINA' $WS/kernel_platform/out/*/msm-kernel/.config 2>/dev/null || echo '(未见 LAHAINA)'
+          echo '===== mkbootfs ====='
+          command -v mkbootfs || echo '(缺)'
+          echo '===== make errors ====='
+          grep -nE 'make.*\*\*\*|command not found|No such file' /tmp/build.log 2>/dev/null | tail -12 || echo '(none)'
+          echo '===== 产物 ====='
+          find "$WS/kernel_platform/out" -maxdepth 8 \( -name 'Image' -o -name 'vmlinux' -o -name 'dtbo.img' -o -name 'vendor_dlkm.img' -o -name 'boot.img' -o -name 'Module.symvers' \) 2>/dev/null | head -30 || echo '(none)'
+          echo '===== .ko 数量 ====='
+          find "$WS/kernel_platform/out" -name '*.ko' 2>/dev/null | wc -l
+          echo '===== dist ====='
+          ls -la "$WS/kernel_platform/out/msm-waipio-waipio-consolidate/dist" 2>/dev/null | head -30 || echo '(no dist)'
+          echo '===== tail 20 ====='
+          tail -20 /tmp/build.log 2>/dev/null || true
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: lahaina-build-log-v18
+          path: /tmp/build.log
+          if-no-files-found: warn
