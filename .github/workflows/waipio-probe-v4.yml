@@ -1,0 +1,109 @@
+name: 5.10 waipio build probe v4
+
+# v3 结论: PATH 修复生效(HERMETIC_TOOLCHAIN=0), 系统 /usr/bin 回到 PATH
+# v4 目标: 补两个工具链缺口
+#   1. CROSS_COMPILE_COMPAT=arm-linux-gnueabi- -> apt 装 gcc-arm-linux-gnueabi
+#   2. CLANG_PREBUILT_BIN 指向 prebuilts-master/clang/... 但该目录未克隆
+#      -> 用外部 clang 预先塞进 PATH(_setup_env.sh 会保留 PATH 尾部)
+
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        description: 'BUILD_CONFIG path'
+        required: false
+        default: 'msm-kernel/build.config.msm.waipio'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    continue-on-error: true
+
+    env:
+      KERNEL_REPO: https://github.com/OnePlusOSS/android_kernel_oneplus_sm8450
+      KERNEL_REF: oneplus/sm8450_b_16.0_oneplus_10_pro
+      COMMON_REPO: https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8450
+      COMMON_REF: oneplus/sm8450_s_12.1_10_pro
+      MODULES_REPO: https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8450
+      MODULES_REF: oneplus/sm8450_b_16.0_oneplus_10_pro
+      WS: ${{ github.workspace }}/ws
+      BUILD_CONFIG_PATH: ${{ github.event.inputs.config }}
+      HERMETIC_TOOLCHAIN: '0'
+      LTO: 'thin'
+
+    steps:
+      - name: Install cross compilers + build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-arm-linux-gnueabi gcc-aarch64-linux-gnu \
+            bison flex libssl-dev bc zip cpio kmod libelf-dev
+          echo "--- 安装结果 ---"
+          for t in arm-linux-gnueabi-gcc aarch64-linux-gnu-gcc; do
+            printf '%-26s -> %s\n' "$t" "$(command -v $t || echo MISSING)"
+          done
+
+      - name: Fetch clang toolchain
+        run: |
+          set -e
+          mkdir -p /tmp/clang && cd /tmp/clang
+          curl -fL --retry 3 -o clang.tar.gz \
+            "https://github.com/Rancemxn/android_kernel_oppo_sm7325/releases/download/BuildTool/linux-x86-refs_heads_llvm-r383902b-clang-r383902.tar.gz"
+          tar -xzf clang.tar.gz
+          rm -f clang.tar.gz
+          BINDIR=$(find /tmp/clang -maxdepth 5 -type d -name bin | head -1)
+          echo "CLANG_BIN=$BINDIR" >> $GITHUB_ENV
+          echo "clang bin dir: $BINDIR"
+          ls "$BINDIR" | head -20
+          "$BINDIR/clang" --version || true
+
+      - name: Clone all sources
+        run: |
+          set -e
+          mkdir -p "$WS/kernel_platform"
+          git clone --depth 1 -b "$KERNEL_REF"  "$KERNEL_REPO"  "$WS/kernel_platform/msm-kernel"
+          git clone --depth 1 -b "$COMMON_REF"  "$COMMON_REPO"  "$WS/kernel_platform/common"
+          git clone --depth 1 -b "$MODULES_REF" "$MODULES_REPO" /tmp/modules
+          cp -a /tmp/modules/kernel_platform/. "$WS/kernel_platform/" 2>/dev/null || true
+          [ -d /tmp/modules/vendor ] && cp -a /tmp/modules/vendor "$WS/vendor" || true
+          rm -rf /tmp/modules
+          df -h /
+
+      - name: Plumb clang into the expected prebuilt path
+        run: |
+          set -e
+          # build.config.common 里 CLANG_PREBUILT_BIN=prebuilts-master/clang/host/linux-x86/clang-r416183b/bin
+          # 该目录不存在; 直接把下到的 clang 摆进去, 省得依赖 PATH 顺序
+          D="$WS/kernel_platform/prebuilts-master/clang/host/linux-x86/clang-r416183b/bin"
+          mkdir -p "$D"
+          cp -a "$CLANG_BIN"/. "$D"/
+          "$D/clang" --version | head -2
+          ls "$D" | head -10
+
+      - name: Build
+        run: |
+          set -o pipefail
+          cd "$WS/kernel_platform"
+          echo "PWD=$(pwd)  BUILD_CONFIG=$BUILD_CONFIG_PATH  HERMETIC=$HERMETIC_TOOLCHAIN"
+          ( BUILD_CONFIG="$BUILD_CONFIG_PATH" build/build.sh -j$(nproc) 2>&1 ) | tee /tmp/build.log
+          echo "BUILD_EXIT=${PIPESTATUS[0]}"
+        continue-on-error: true
+
+      - name: Report
+        if: always()
+        run: |
+          echo "===== key lines ====="
+          grep -nE 'command not found|No such file or directory|Error [0-9]|error:|fatal|Kernel: arch' /tmp/build.log 2>/dev/null | tail -40 || echo "(none)"
+          echo
+          echo "===== artifacts ====="
+          find "$WS/kernel_platform/out" -maxdepth 6 \( -name 'Image' -o -name 'vmlinux' -o -name 'Image.gz' \) 2>/dev/null | head -20 || true
+          echo "===== tail ====="
+          tail -30 /tmp/build.log 2>/dev/null || true
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: waipio-build-log-v4
+          path: /tmp/build.log
+          if-no-files-found: warn
