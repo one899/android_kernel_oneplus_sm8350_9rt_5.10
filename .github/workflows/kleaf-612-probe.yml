@@ -1,0 +1,149 @@
+name: 6.12 lahaina Kleaf probe v15
+
+# 目的: 验证 KERNEL.PLATFORM.5.0 (6.12) 的 Kleaf/Bazel 体系能否在 GH runner 上跑通
+#   6.12 有官方完整 lahaina BSP (build.config.msm.lahaina / lahaina_perf.bzl / 102行模块清单 / 126 DTS)
+#   而 5.10 的 lahaina 要手工拼 -> 若 6.12 能跑通, 直接瞄 6.12 更划算
+#
+# 本探测**不做真编译**, 只到 --dry-run:
+#   repo sync 55 个项目 -> build_with_bazel.py -t lahaina consolidate --dry-run
+#   dry-run 会一次性暴露: 缺 module / 缺工具 / 缺符号链接
+#
+# 已知约束: 磁盘峰值估 50-65 GiB (GH runner 仅 ~14GB 空闲) -> 必须先腾空间
+#           内存 16GB + JVM 80% -> 限制 jobs
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        required: false
+        default: 'lahaina'
+      variant:
+        required: false
+        default: 'consolidate'
+      do_sync:
+        description: '是否真的 repo sync (0 只做环境准备)'
+        required: false
+        default: '1'
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    continue-on-error: true
+
+    env:
+      MANIFEST_URL: https://git.codelinaro.org/clo/la/kernelplatform/manifest
+      MANIFEST_TAG: KERNEL.PLATFORM.5.0.r47-01200-kernel.0
+      MANIFEST_XML: AU_LINUX_KERNEL.PLATFORM.5.0.R47.00.00.00.241.012.xml
+      KP: ${{ github.workspace }}/kp
+      TARGET: ${{ github.event.inputs.target }}
+      VARIANT: ${{ github.event.inputs.variant }}
+
+    steps:
+      - name: Free disk space
+        run: |
+          echo '=== 清理前 ==='
+          df -h / /mnt 2>/dev/null || df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      "$AGENT_TOOLSDIRECTORY" /opt/hostedtoolcache 2>/dev/null || true
+          sudo docker image prune -af 2>/dev/null || true
+          sudo swapoff -a 2>/dev/null || true
+          df -h / /mnt 2>/dev/null || df -h /
+
+      - name: Install deps (repo, bazel host bits)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq git python3 curl unzip zip rsync cpio \
+            libssl-dev bc bison flex libelf-dev build-essential
+          mkdir -p ~/bin
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o ~/bin/repo || \
+            curl -fsSL https://mirrors.tuna.tsinghua.edu.cn/git/git-repo -o ~/bin/repo
+          chmod +x ~/bin/repo
+          echo "$HOME/bin" >> $GITHUB_PATH
+          ~/bin/repo --version || true
+          df -h /
+
+      - name: repo init
+        run: |
+          mkdir -p "$KP" && cd "$KP"
+          git config --global user.email ci@local
+          git config --global user.name ci
+          git config --global http.postBuffer 524288000
+          repo init --depth=1 -u "$MANIFEST_URL" -b "$MANIFEST_TAG" -m "$MANIFEST_XML"
+          echo '--- manifest 链接的顶层目录 ---'
+          ls -la "$KP/.repo/manifests" | head -20
+          head -40 "$KP/.repo/manifests/$MANIFEST_XML" || true
+
+      - name: repo sync
+        if: ${{ github.event.inputs.do_sync != '0' }}
+        run: |
+          cd "$KP"
+          repo sync -c -j8 --no-tags --optimized-fetch --prune 2>&1 | tail -40
+          echo '=== sync 后 ==='
+          df -h /
+          du -sh "$KP" 2>/dev/null || true
+          echo '--- kernel_platform 顶层 ---'
+          ls "$KP" | head -30
+          echo '--- 找 tools/bazel 等 linkfile ---'
+          ls -la "$KP/kernel_platform/tools/bazel" 2>/dev/null || echo '(无 tools/bazel)'
+          ls -la "$KP/kernel_platform/WORKSPACE" 2>/dev/null || echo '(无 WORKSPACE)'
+          ls -la "$KP/kernel_platform/MODULE.bazel" 2>/dev/null || echo '(无 MODULE.bazel)'
+          ls "$KP/kernel_platform" | head -30
+
+      - name: Locate build entry + verify lahaina target
+        run: |
+          cd "$KP"
+          K="$KP/kernel_platform"
+          [ -d "$K" ] || K="$KP"
+          echo "KERNEL_PLATFORM=$K" >> $GITHUB_ENV
+          echo '--- 找 build_with_bazel.py ---'
+          find "$KP" -maxdepth 3 -name 'build_with_bazel.py' 2>/dev/null | head
+          echo '--- 找 build.config.msm.lahaina ---'
+          find "$KP" -maxdepth 4 -name 'build.config.msm.lahaina' 2>/dev/null | head
+          echo '--- 找 lahaina.bzl / lahaina_consolidate ---'
+          find "$KP" -maxdepth 5 \( -name 'lahaina*.bzl' -o -name 'BUILD.bazel' \) 2>/dev/null | head -12
+          echo '--- soc-repo / common ---'
+          ls "$K/soc-repo" 2>/dev/null | head -15 || echo '(无 soc-repo)'
+          ls "$K/common" 2>/dev/null | head -8 || echo '(无 common)'
+
+      - name: Bazel dry-run (不编译)
+        run: |
+          set -o pipefail
+          K="${KERNEL_PLATFORM:-$KP/kernel_platform}"
+          cd "$K"
+          echo "=== 在 $K 执行 dry-run ==="
+          if [ -f build_with_bazel.py ]; then
+            ( python3 build_with_bazel.py -t "$TARGET" "$VARIANT" --dry-run 2>&1 ) | tee /tmp/dry.log
+          else
+            echo 'build_with_bazel.py 不在, 改直接调 bazel'
+            ( tools/bazel run "//soc-repo:${TARGET}_${VARIANT}_dist" -- --dry-run 2>&1 ) | tee /tmp/dry.log
+          fi
+          echo "DRY_EXIT=${PIPESTATUS[0]}"
+        continue-on-error: true
+
+      - name: Report
+        if: always()
+        run: |
+          echo '===== 环境 ====='
+          df -h / | tail -2
+          free -g | head -3
+          nproc
+          echo
+          echo '===== dry-run 关键行 ====='
+          grep -nE 'ERROR|error:|not found|No such|Failed|failed|Traceback|no such module|missing' /tmp/dry.log 2>/dev/null | head -30 || echo '(无匹配)'
+          echo
+          echo '===== dry-run tail 30 ====='
+          tail -30 /tmp/dry.log 2>/dev/null || echo '(无 dry.log)'
+          echo
+          echo '===== 磁盘占用 ====='
+          du -sh "$KP" 2>/dev/null || true
+          du -sh "$KP/kernel_platform" 2>/dev/null || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: kleaf-612-dryrun-log
+          path: /tmp/dry.log
+          if-no-files-found: warn
