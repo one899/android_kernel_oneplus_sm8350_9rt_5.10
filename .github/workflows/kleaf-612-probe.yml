@@ -1,4 +1,4 @@
-name: 6.12 lahaina Kleaf probe v16
+name: 6.12 lahaina Kleaf probe v17
 
 # 目的: 验证 KERNEL.PLATFORM.5.0 (6.12) 的 Kleaf/Bazel 体系能否在 GH runner 上跑通
 #   6.12 有官方完整 lahaina BSP (build.config.msm.lahaina / lahaina_perf.bzl / 102行模块清单 / 126 DTS)
@@ -64,19 +64,51 @@ jobs:
           ~/bin/repo --version || true
           df -h /
 
-      - name: repo init
+      - name: repo init (tag 需要 workaround: repo -b 只认 branch)
         run: |
+          set -e
           mkdir -p "$KP" && cd "$KP"
           git config --global user.email ci@local
           git config --global user.name ci
           git config --global http.postBuffer 524288000
-          repo init --depth=1 -u "$MANIFEST_URL" -b "$MANIFEST_TAG" -m "$MANIFEST_XML"
-          echo '--- manifest 链接的顶层目录 ---'
-          ls -la "$KP/.repo/manifests" | head -20
-          head -40 "$KP/.repo/manifests/$MANIFEST_XML" || true
-
+          echo "=== 0) 先确认 tag 与 xml 存在 ==="
+          git ls-remote --tags "$MANIFEST_URL" 2>/dev/null | grep -F "$MANIFEST_TAG" | head -3 || echo '(tag 未列出)'
+          echo
+          echo '=== 1) 直接 -b <tag> (预期失败, 留证) ==='
+          if repo init --depth=1 -u "$MANIFEST_URL" -b "$MANIFEST_TAG" -m "$MANIFEST_XML" 2>&1 | tail -5; then
+            if [ -f "$KP/.repo/manifests/$MANIFEST_XML" ]; then echo '策略1 成功'; echo 'INIT_OK=1' >> $GITHUB_ENV; fi
+          fi
+          if [ -z "${INIT_OK:-}" ]; then
+            echo
+            echo '=== 2) 本地克隆 manifest@tag, 造 branch, 用本地路径做 -u ==='
+            rm -rf /tmp/mf "$KP/.repo"
+            git clone --depth 1 --branch "$MANIFEST_TAG" "$MANIFEST_URL" /tmp/mf
+            cd /tmp/mf
+            git checkout -b ci-manifest
+            echo "本地 manifest 分支就绪, xml 列表(含 5.0):"
+            ls | grep -F 'PLATFORM.5.0' | head -5 || echo '(无 5.0 xml)'
+            cd "$KP"
+            if repo init --depth=1 -u /tmp/mf -b ci-manifest -m "$MANIFEST_XML" 2>&1 | tail -5; then
+              if [ -f "$KP/.repo/manifests/$MANIFEST_XML" ]; then echo '策略2 成功'; echo 'INIT_OK=1' >> $GITHUB_ENV; fi
+            fi
+          fi
+          if [ -z "${INIT_OK:-}" ]; then
+            echo
+            echo '=== 3) 克隆整个 manifest repo (不 --depth), 再试 ==='
+            rm -rf /tmp/mf "$KP/.repo"
+            git clone "$MANIFEST_URL" /tmp/mf
+            cd /tmp/mf && git checkout "$MANIFEST_TAG" && git checkout -b ci-manifest-full
+            cd "$KP"
+            if repo init --depth=1 -u /tmp/mf -b ci-manifest-full -m "$MANIFEST_XML" 2>&1 | tail -5; then
+              if [ -f "$KP/.repo/manifests/$MANIFEST_XML" ]; then echo '策略3 成功'; echo 'INIT_OK=1' >> $GITHUB_ENV; fi
+            fi
+          fi
+          echo
+          echo "INIT_OK=${INIT_OK:-0}"
+          ls -la "$KP/.repo/manifests/" 2>/dev/null | head -8 || true
+          head -25 "$KP/.repo/manifests/$MANIFEST_XML" 2>/dev/null || echo '(没有该 xml)'
       - name: repo sync
-        if: ${{ github.event.inputs.do_sync != '0' }}
+        if: ${{ env.INIT_OK == '1' && github.event.inputs.do_sync != '0' }}
         run: |
           cd "$KP"
           repo sync -c -j8 --no-tags --optimized-fetch --prune 2>&1 | tail -40
@@ -144,6 +176,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: kleaf-612-dryrun-log-v16
+          name: kleaf-612-dryrun-log-v17
           path: /tmp/dry.log
           if-no-files-found: warn
