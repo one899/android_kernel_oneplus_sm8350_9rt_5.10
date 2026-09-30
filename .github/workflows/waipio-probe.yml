@@ -1,0 +1,132 @@
+name: 5.10 waipio build probe
+
+# 目的：验证 OPLUS 5.10 内核树能否在 CI 上独立编出 waipio 目标。
+# 这是迁移方案 §5 的「最小验证」第 2 步（不依赖 AOSP lunch 环境）。
+# 首次运行定位为「侦察 + 尝试」：即使构建失败，也会输出布局、symlink 解析、脚本用法等诊断信息。
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'MSM_ARCH target (waipio / lahaina)'
+        required: false
+        default: 'waipio'
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    continue-on-error: true
+
+    env:
+      KERNEL_REPO: https://github.com/OnePlusOSS/android_kernel_oneplus_sm8450
+      KERNEL_REF: oneplus/sm8450_b_16.0_oneplus_10_pro
+      COMMON_REPO: https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8450
+      COMMON_REF: oneplus/sm8450_s_12.1_10_pro
+      MODULES_REPO: https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8450
+      MODULES_REF: oneplus/sm8450_b_16.0_oneplus_10_pro
+      WS: ${{ github.workspace }}/ws
+
+    steps:
+      - name: Show runner disk
+        run: df -h /
+
+      - name: Setup workspace
+        run: |
+          set -e
+          mkdir -p "$WS/kernel_platform"
+
+      - name: Clone msm-kernel (shallow)
+        run: |
+          set -e
+          git clone --depth 1 -b "$KERNEL_REF" "$KERNEL_REPO" "$WS/kernel_platform/msm-kernel"
+          echo "msm-kernel HEAD: $(git -C "$WS/kernel_platform/msm-kernel" rev-parse --short HEAD)"
+          grep -m3 -E '^(VERSION|PATCHLEVEL|SUBLEVEL) ' "$WS/kernel_platform/msm-kernel/Makefile" || true
+
+      - name: Clone GKI common (shallow)
+        run: |
+          set -e
+          git clone --depth 1 -b "$COMMON_REF" "$COMMON_REPO" "$WS/kernel_platform/common"
+          grep -m3 -E '^(VERSION|PATCHLEVEL|SUBLEVEL) ' "$WS/kernel_platform/common/Makefile" || true
+
+      - name: Clone modules + devicetree (shallow)
+        run: |
+          set -e
+          git clone --depth 1 -b "$MODULES_REF" "$MODULES_REPO" /tmp/modules
+          ls -la /tmp/modules
+          cp -a /tmp/modules/kernel_platform/. "$WS/kernel_platform/" 2>/dev/null || true
+          [ -d /tmp/modules/vendor ] && cp -a /tmp/modules/vendor "$WS/vendor" || true
+          rm -rf /tmp/modules
+          df -h /
+
+      - name: Layout + symlink resolution checks
+        run: |
+          echo "===== ws 顶层 ====="
+          ls -la "$WS"
+          echo "===== ws/kernel_platform ====="
+          ls -la "$WS/kernel_platform"
+          echo "===== OPLUS symlink 解析检查 ====="
+          for p in "$WS/kernel_platform/msm-kernel/kernel/oplus_perf_sched" \
+                   "$WS/kernel_platform/msm-kernel/kernel/sched/walt/oem_sched" \
+                   "$WS/kernel_platform/msm-kernel/kernel/sched/walt/tuning"; do
+            echo "--- $p"
+            if [ -L "$p" ]; then
+              echo "  symlink -> $(readlink "$p")"
+              echo "  解析结果: $(readlink -f "$p" || echo BROKEN)"
+              [ -e "$p" ] && echo "  OK (目标存在)" || echo "  *** 悬空 ***"
+            else
+              echo "  (不是 symlink 或不存在)"
+            fi
+          done
+          echo "===== vendor 树 ====="
+          ls -la "$WS/vendor" 2>/dev/null || echo "vendor 缺失"
+
+      - name: Build script usage
+        run: |
+          for s in "$WS/kernel_platform/build/build.sh" \
+                   "$WS/kernel_platform/build/envsetup.sh"; do
+            echo "===== $s ====="
+            if [ -f "$s" ]; then
+              head -60 "$s" | grep -nE '^(#|echo|Usage|usage)' | head -30 || head -30 "$s"
+            else
+              echo "(不存在)"
+            fi
+          done
+          echo "===== kernel_platform/build 下的 build.config* ====="
+          ls "$WS/kernel_platform/msm-kernel"/build.config.* 2>/dev/null | head -30
+
+      - name: Attempt waipio build (best effort)
+        run: |
+          set -x
+          cd "$WS"
+          export TARGET=${{ github.event.inputs.target }}
+          echo "尝试目标: $TARGET"
+          # 先按 Google 标准入口试；失败也不影响本次侦察产出
+          if [ -x kernel_platform/build/build.sh ]; then
+            timeout 5400 kernel_platform/build/build.sh "$TARGET" 2>&1 | tail -200 || true
+          fi
+        continue-on-error: true
+
+      - name: Save diagnostics
+        if: always()
+        run: |
+          {
+            echo "### 布局"
+            find "$WS" -maxdepth 2 -type d 2>/dev/null | head -60
+            echo
+            echo "### msm-kernel build.config"
+            ls "$WS/kernel_platform/msm-kernel"/build.config* 2>/dev/null
+            echo
+            echo "### 内核版本"
+            grep -m3 -E '^(VERSION|PATCHLEVEL|SUBLEVEL) ' "$WS/kernel_platform/msm-kernel/Makefile" || true
+          } > "$WS/diagnostics.txt" 2>&1 || true
+          cat "$WS/diagnostics.txt" || true
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: waipio-probe-diagnostics
+          path: |
+            ${{ github.workspace }}/ws/diagnostics.txt
+          if-no-files-found: warn
