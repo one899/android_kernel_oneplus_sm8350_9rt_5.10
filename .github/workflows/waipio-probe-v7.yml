@@ -1,0 +1,120 @@
+name: 5.10 waipio build probe v7
+
+# v6 结论: clang 完全可用(自检 OK, HOSTCC/LEX 都通过)
+#   卡在 YACC: build/build-tools/path/linux-x86/bison 是个 wrapper,
+#   exec prebuilts/build-tools/linux-x86/bin/bison —— 该 prebuilts 仓库未克隆。
+#   它排在 PATH 前面, 挡住了 apt 装好的 /usr/bin/bison。
+#
+# v7: 若 prebuilts/build-tools 不存在, 移除所有指向它的 wrapper, 让 PATH 落到系统工具
+
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        description: 'BUILD_CONFIG path'
+        required: false
+        default: 'msm-kernel/build.config.msm.waipio'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    continue-on-error: true
+
+    env:
+      KERNEL_REPO: https://github.com/OnePlusOSS/android_kernel_oneplus_sm8450
+      KERNEL_REF: oneplus/sm8450_b_16.0_oneplus_10_pro
+      COMMON_REPO: https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8450
+      COMMON_REF: oneplus/sm8450_s_12.1_10_pro
+      MODULES_REPO: https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8450
+      MODULES_REF: oneplus/sm8450_b_16.0_oneplus_10_pro
+      WS: ${{ github.workspace }}/ws
+      BUILD_CONFIG_PATH: ${{ github.event.inputs.config }}
+      HERMETIC_TOOLCHAIN: '0'
+      LTO: 'thin'
+
+    steps:
+      - name: Install deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-arm-linux-gnueabi gcc-aarch64-linux-gnu \
+            bison flex libssl-dev bc zip cpio kmod libelf-dev python3
+          for t in bison flex; do printf '%-8s -> %s\n' "$t" "$(command -v $t)"; done
+
+      - name: Fetch clang
+        run: |
+          set -e
+          mkdir -p /tmp/clang && cd /tmp/clang
+          curl -fL --retry 3 -o clang.tar.gz \
+            "https://github.com/Rancemxn/android_kernel_oppo_sm7325/releases/download/BuildTool/linux-x86-refs_heads_llvm-r383902b-clang-r383902.tar.gz"
+          tar -xzf clang.tar.gz && rm -f clang.tar.gz
+          B=$(dirname "$(find /tmp/clang -maxdepth 6 -name clang \( -type f -o -type l \) | head -1)")
+          L=$(dirname "$(find /tmp/clang -maxdepth 4 -name 'libc++.so*' | head -1)")
+          echo "CLANG_ROOT=$(dirname $B)" >> $GITHUB_ENV
+          echo "CLANG_LIBDIR=$L" >> $GITHUB_ENV
+          echo "clang=$B  lib=$L"
+
+      - name: Clone sources
+        run: |
+          set -e
+          mkdir -p "$WS/kernel_platform"
+          git clone --depth 1 -b "$KERNEL_REF"  "$KERNEL_REPO"  "$WS/kernel_platform/msm-kernel"
+          git clone --depth 1 -b "$COMMON_REF"  "$COMMON_REPO"  "$WS/kernel_platform/common"
+          git clone --depth 1 -b "$MODULES_REF" "$MODULES_REPO" /tmp/modules
+          cp -a /tmp/modules/kernel_platform/. "$WS/kernel_platform/" 2>/dev/null || true
+          [ -d /tmp/modules/vendor ] && cp -a /tmp/modules/vendor "$WS/vendor" || true
+          rm -rf /tmp/modules
+          df -h /
+
+      - name: Stage clang + repair broken build-tool wrappers
+        run: |
+          set -e
+          D="$WS/kernel_platform/prebuilts-master/clang/host/linux-x86/clang-r416183b"
+          mkdir -p "$(dirname "$D")"; rm -rf "$D"; ln -sfn "$CLANG_ROOT" "$D"
+          echo "LD_LIBRARY_PATH=$CLANG_LIBDIR:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          "$D/bin/clang" -x c -c /dev/null -o /tmp/t.o && echo "OK: clang works"
+
+          WRAPDIR="$WS/kernel_platform/build/build-tools/path/linux-x86"
+          PB="$WS/kernel_platform/prebuilts/build-tools/linux-x86/bin"
+          echo "--- wrapper dir 内容 ---"
+          ls "$WRAPDIR" || true
+          if [ ! -d "$PB" ]; then
+            echo "*** $PB 不存在: 移除指向它的 wrapper, 让 /usr/bin 接管 ***"
+            grep -rl 'prebuilts/build-tools' "$WRAPDIR" 2>/dev/null | while read -r f; do
+              echo "  remove $(basename "$f")"
+              rm -f "$f"
+            done
+          fi
+          echo "--- 清理后 ---"
+          ls "$WRAPDIR" || true
+          echo "--- 解析检查 ---"
+          for t in bison flex; do printf '%-8s -> %s\n' "$t" "$(command -v $t)"; done
+
+      - name: Build
+        run: |
+          set -o pipefail
+          cd "$WS/kernel_platform"
+          echo "BUILD_CONFIG=$BUILD_CONFIG_PATH"
+          ( BUILD_CONFIG="$BUILD_CONFIG_PATH" build/build.sh -j$(nproc) 2>&1 ) | tee /tmp/build.log
+          echo "BUILD_EXIT=${PIPESTATUS[0]}"
+        continue-on-error: true
+
+      - name: Report
+        if: always()
+        run: |
+          echo "===== key lines ====="
+          grep -nE 'command not found|not found|Error [0-9]|error:|fatal error|Kernel: arch' /tmp/build.log 2>/dev/null | tail -40 || echo "(none)"
+          echo "===== artifacts ====="
+          find "$WS/kernel_platform/out" -maxdepth 7 \( -name 'Image' -o -name 'vmlinux' -o -name 'Image.gz' \) 2>/dev/null | head -20 || echo "(none)"
+          echo "===== lines ====="
+          wc -l < /tmp/build.log 2>/dev/null || echo 0
+          echo "===== tail 20 ====="
+          tail -20 /tmp/build.log 2>/dev/null || true
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: waipio-build-log-v7
+          path: /tmp/build.log
+          if-no-files-found: warn
