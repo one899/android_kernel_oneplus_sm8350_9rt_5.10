@@ -1,0 +1,165 @@
+name: 5.10 waipio build probe v8
+
+# v7 结论: 构建真正跑了 8 分钟, CC 835 次, arch/arm64 fs init mm 都编了
+#   唯一致命错误: arch/arm64/kvm/hyp/nvhe/hyp-reloc.S -> "unknown relocation name"
+#   = clang 版本太旧。build.config.common 要求 clang-r416183b(clang 12),
+#     我用的是 clang-r383902(clang 11), 其汇编器不认识 R_AARCH64_PREL32。
+#   (83 条 "Broken pipe" 是噪声, 没中断构建)
+#
+# v8: 取正确的 clang-r416183b —— 用 AOSP Gitiles 的 archive 接口下载单目录
+#     失败则回退系统 clang(apt)
+
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        description: 'BUILD_CONFIG path'
+        required: false
+        default: 'msm-kernel/build.config.msm.waipio'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    continue-on-error: true
+
+    env:
+      KERNEL_REPO: https://github.com/one899/android_kernel_oneplus_sm8450_5.10_martini
+      KERNEL_REF: oneplus/sm8450_b_16.0_oneplus_10_pro
+      COMMON_REPO: https://github.com/one899/android_kernel_common_oneplus_sm8450_5.10_martini
+      COMMON_REF: oneplus/sm8450_s_12.1_10_pro
+      MODULES_REPO: https://github.com/one899/android_kernel_modules_and_devicetree_sm8450_5.10_martini
+      MODULES_REF: oneplus/sm8450_b_16.0_oneplus_10_pro
+      WS: ${{ github.workspace }}/ws
+      BUILD_CONFIG_PATH: ${{ github.event.inputs.config }}
+      HERMETIC_TOOLCHAIN: '0'
+      LTO: 'thin'
+
+    steps:
+      - name: Install deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-arm-linux-gnueabi gcc-aarch64-linux-gnu \
+            bison flex libssl-dev bc zip cpio kmod libelf-dev python3 clang lld llvm
+
+      - name: Fetch clang-r416183b (AOSP archive), fallback to system clang
+        id: getclang
+        run: |
+          set -u
+          ARCH_BASE="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads"
+          OK=0
+          mkdir -p /tmp/aosp
+          for BR in android-gs-raviole-5.10-android12-d1 \
+                    android-gs-raviole-5.10-android12-qpr3 \
+                    android-gs-raviole-5.10-android12L \
+                    main master; do
+            URL="$ARCH_BASE/$BR/clang-r416183b.tar.gz"
+            echo "尝试 $BR ..."
+            if curl -fL --retry 2 --retry-delay 3 -m 900 -o /tmp/aosp/clang.tar.gz "$URL" 2>/dev/null; then
+              SZ=$(stat -c%s /tmp/aosp/clang.tar.gz 2>/dev/null || echo 0)
+              echo "  下载成功, $SZ 字节"
+              if [ "$SZ" -gt 1000000 ]; then
+                mkdir -p /tmp/aosp/x && tar -xzf /tmp/aosp/clang.tar.gz -C /tmp/aosp/x
+                if [ -x /tmp/aosp/x/bin/clang ]; then
+                  echo "  ✓ clang-r416183b 解包成功 (来自 $BR)"
+                  echo "CLANG_ROOT=/tmp/aosp/x" >> $GITHUB_ENV
+                  OK=1
+                  break
+                else
+                  echo "  解包后没找到 bin/clang"
+                fi
+              fi
+            else
+              echo "  下载失败"
+            fi
+          done
+
+          if [ "$OK" = "0" ]; then
+            echo "*** 回退系统 clang ***"
+            echo "CLANG_ROOT=SYSTEM" >> $GITHUB_ENV
+          fi
+
+      - name: Resolve clang root and library path
+        run: |
+          set -e
+          if [ "$CLANG_ROOT" = "SYSTEM" ] || [ -z "${CLANG_ROOT:-}" ]; then
+            CB=$(dirname "$(command -v clang)")
+            CL=$(dirname "$(find /usr/lib -maxdepth 4 -name 'libc++.so*' 2>/dev/null | head -1)" 2>/dev/null || echo "")
+            echo "CLANG_ROOT=$CB/.." >> $GITHUB_ENV
+            echo "CLANG_LIBDIR=$CL" >> $GITHUB_ENV
+            echo "使用系统 clang: $CB/clang"
+          else
+            CL=$(dirname "$(find "$CLANG_ROOT" -maxdepth 4 -name 'libc++.so*' 2>/dev/null | head -1)" 2>/dev/null || echo "")
+            echo "CLANG_LIBDIR=$CL" >> $GITHUB_ENV
+            echo "使用 AOSP clang: $CLANG_ROOT/bin/clang   lib=$CL"
+          fi
+          echo "LD_LIBRARY_PATH=$CLANG_LIBDIR:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          "$CLANG_ROOT/bin/clang" --version 2>/dev/null | head -2 || clang --version | head -2
+
+      - name: Clone sources (from our forks)
+        run: |
+          set -e
+          mkdir -p "$WS/kernel_platform"
+          git clone --depth 1 -b "$KERNEL_REF"  "$KERNEL_REPO"  "$WS/kernel_platform/msm-kernel"
+          git clone --depth 1 -b "$COMMON_REF"  "$COMMON_REPO"  "$WS/kernel_platform/common"
+          git clone --depth 1 -b "$MODULES_REF" "$MODULES_REPO" /tmp/modules
+          cp -a /tmp/modules/kernel_platform/. "$WS/kernel_platform/" 2>/dev/null || true
+          [ -d /tmp/modules/vendor ] && cp -a /tmp/modules/vendor "$WS/vendor" || true
+          rm -rf /tmp/modules
+          df -h /
+
+      - name: Stage clang + repair wrappers
+        run: |
+          set -e
+          D="$WS/kernel_platform/prebuilts-master/clang/host/linux-x86/clang-r416183b"
+          mkdir -p "$(dirname "$D")"; rm -rf "$D"
+          if [ "$CLANG_ROOT" != "SYSTEM" ] && [ -n "${CLANG_ROOT:-}" ]; then
+            ln -sfn "$CLANG_ROOT" "$D"
+          else
+            mkdir -p "$D" && ln -sf "$(command -v clang)" "$D/clang"
+          fi
+          "$D/bin/clang" --version | head -2 || true
+          "$D/bin/clang" -x c -c /dev/null -o /tmp/t.o && echo "OK: clang works" || echo "FAIL: clang broken"
+
+          WRAPDIR="$WS/kernel_platform/build/build-tools/path/linux-x86"
+          PB="$WS/kernel_platform/prebuilts/build-tools/linux-x86/bin"
+          if [ ! -d "$PB" ]; then
+            grep -rl 'prebuilts/build-tools' "$WRAPDIR" 2>/dev/null | while read -r f; do
+              echo "  remove wrapper $(basename "$f")"; rm -f "$f"
+            done
+          fi
+
+      - name: Build
+        run: |
+          set -o pipefail
+          cd "$WS/kernel_platform"
+          ( BUILD_CONFIG="$BUILD_CONFIG_PATH" build/build.sh -j$(nproc) 2>&1 ) | tee /tmp/build.log
+          echo "BUILD_EXIT=${PIPESTATUS[0]}"
+        continue-on-error: true
+
+      - name: Report
+        if: always()
+        run: |
+          echo "===== clang 版本 ====="
+          "$CLANG_ROOT/bin/clang" --version 2>/dev/null | head -2 || clang --version | head -2
+          echo
+          echo "===== 唯一化 error 类型 ====="
+          grep -oE 'error: [^,]*' /tmp/build.log 2>/dev/null | sort | uniq -c | sort -rn | head -12 || true
+          echo "===== 计数 ====="
+          for k in 'CC ' 'LD ' 'AR ' 'error:' 'unknown relocation'; do
+            printf '%-22s %s\n' "$k" "$(grep -cF "$k" /tmp/build.log 2>/dev/null || echo 0)"
+          done
+          echo "===== artifacts ====="
+          find "$WS/kernel_platform/out" -maxdepth 8 \( -name 'Image' -o -name 'vmlinux' -o -name 'Image.gz' \) 2>/dev/null | head -20 || echo "(none)"
+          echo "===== make 错误 ====="
+          grep -nE 'make.*\*\*\*' /tmp/build.log 2>/dev/null | tail -12 || echo "(none)"
+          echo "===== tail 15 ====="
+          tail -15 /tmp/build.log 2>/dev/null || true
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: waipio-build-log-v8
+          path: /tmp/build.log
+          if-no-files-found: warn
