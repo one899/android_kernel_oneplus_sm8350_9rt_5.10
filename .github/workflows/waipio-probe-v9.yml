@@ -1,0 +1,128 @@
+name: 5.10 waipio build probe v9
+
+# v8 结论: GKI common 阶段完整成功, 产出 Image 与 vmlinux
+#   clang-r416183b (clang 12.0.5) 从 AOSP archive 成功获取, 重定位错误消失
+#     artifacts: out/msm-waipio-waipio-consolidate/gki_kernel/dist/Image
+#                out/msm-waipio-waipio-consolidate/gki_kernel/dist/vmlinux
+#
+#   进入 msm-kernel(vendor) 阶段后卡在:
+#     build.config.msm.common line 25: cd kernel_platform/external/dtc -> No such file
+#     make: *** No rule to make target 'all'.  Stop.
+#   读 build.config.msm.common 原文确认:
+#     function compile_external_dtc() { cd <ROOT_DIR>/external/dtc; make all install ... }
+#     append_cmd PRE_DEFCONFIG_CMDS 'compile_external_dtc'
+#   => 唯一缺的就是 external/dtc
+#
+# v9: 补上 clo/la/kernel_platform/external/dtc @ KERNEL.PLATFORM.1.0.c27 (5.10 世代)
+
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        required: false
+        default: 'msm-kernel/build.config.msm.waipio'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    continue-on-error: true
+
+    env:
+      KERNEL_REPO: https://github.com/one899/android_kernel_oneplus_sm8450_5.10_martini
+      KERNEL_REF: oneplus/sm8450_b_16.0_oneplus_10_pro
+      COMMON_REPO: https://github.com/one899/android_kernel_common_oneplus_sm8450_5.10_martini
+      COMMON_REF: oneplus/sm8450_s_12.1_10_pro
+      MODULES_REPO: https://github.com/one899/android_kernel_modules_and_devicetree_sm8450_5.10_martini
+      MODULES_REF: oneplus/sm8450_b_16.0_oneplus_10_pro
+      DTC_REPO: https://git.codelinaro.org/clo/la/kernel_platform/external/dtc.git
+      DTC_REF: KERNEL.PLATFORM.1.0.c27
+      WS: ${{ github.workspace }}/ws
+      BUILD_CONFIG_PATH: ${{ github.event.inputs.config }}
+      HERMETIC_TOOLCHAIN: '0'
+      LTO: 'thin'
+
+    steps:
+      - name: Install deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-arm-linux-gnueabi gcc-aarch64-linux-gnu \
+            bison flex libssl-dev bc zip cpio kmod libelf-dev python3 pkg-config
+
+      - name: Fetch clang-r416183b
+        run: |
+          set -e
+          ARCH_BASE="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads"
+          mkdir -p /tmp/aosp
+          for BR in android-gs-raviole-5.10-android12-d1 android-gs-raviole-5.10-android12-qpr3 main; do
+            if curl -fL --retry 2 -m 900 -o /tmp/aosp/c.tar.gz "$ARCH_BASE/$BR/clang-r416183b.tar.gz" 2>/dev/null; then
+              SZ=$(stat -c%s /tmp/aosp/c.tar.gz 2>/dev/null || echo 0)
+              if [ "$SZ" -gt 1000000 ]; then
+                mkdir -p /tmp/aosp/x && tar -xzf /tmp/aosp/c.tar.gz -C /tmp/aosp/x
+                if [ -x /tmp/aosp/x/bin/clang ]; then echo "CLANG_ROOT=/tmp/aosp/x" >> $GITHUB_ENV; echo "got $BR"; break; fi
+              fi
+            fi
+          done
+          if [ -z "${CLANG_ROOT:-}" ]; then echo "CLANG_ROOT=SYSTEM" >> $GITHUB_ENV; echo "fallback system clang"; fi
+
+      - name: Clone sources + external/dtc
+        run: |
+          set -e
+          mkdir -p "$WS/kernel_platform"
+          git clone --depth 1 -b "$KERNEL_REF"  "$KERNEL_REPO"  "$WS/kernel_platform/msm-kernel"
+          git clone --depth 1 -b "$COMMON_REF"  "$COMMON_REPO"  "$WS/kernel_platform/common"
+          git clone --depth 1 -b "$MODULES_REF" "$MODULES_REPO" /tmp/modules
+          cp -a /tmp/modules/kernel_platform/. "$WS/kernel_platform/" 2>/dev/null || true
+          [ -d /tmp/modules/vendor ] && cp -a /tmp/modules/vendor "$WS/vendor" || true
+          rm -rf /tmp/modules
+          echo "--- external/dtc ---"
+          git clone --depth 1 -b "$DTC_REF" "$DTC_REPO" "$WS/kernel_platform/external/dtc"
+          ls "$WS/kernel_platform/external/dtc" | head -12
+          echo "--- kernel_platform 顶层 ---"
+          ls "$WS/kernel_platform"
+          df -h /
+
+      - name: Stage clang + repair wrappers
+        run: |
+          set -e
+          D="$WS/kernel_platform/prebuilts-master/clang/host/linux-x86/clang-r416183b"
+          mkdir -p "$(dirname "$D")"; rm -rf "$D"
+          if [ "$CLANG_ROOT" != "SYSTEM" ]; then ln -sfn "$CLANG_ROOT" "$D"; else mkdir -p "$D" && ln -sf "$(command -v clang)" "$D/clang"; fi
+          "$D/bin/clang" --version | head -1
+          "$D/bin/clang" -x c -c /dev/null -o /tmp/t.o && echo "OK: clang works"
+          WRAPDIR="$WS/kernel_platform/build/build-tools/path/linux-x86"
+          if [ ! -d "$WS/kernel_platform/prebuilts/build-tools/linux-x86/bin" ]; then
+            grep -rl 'prebuilts/build-tools' "$WRAPDIR" 2>/dev/null | while read -r f; do rm -f "$f"; done
+          fi
+
+      - name: Build
+        run: |
+          set -o pipefail
+          cd "$WS/kernel_platform"
+          ( BUILD_CONFIG="$BUILD_CONFIG_PATH" build/build.sh -j$(nproc) 2>&1 ) | tee /tmp/build.log
+          echo "BUILD_EXIT=${PIPESTATUS[0]}"
+        continue-on-error: true
+
+      - name: Report
+        if: always()
+        run: |
+          echo "===== error types ====="
+          grep -oE 'error: [^,]*' /tmp/build.log 2>/dev/null | sort | uniq -c | sort -rn | head -10 || true
+          echo "===== counts ====="
+          for k in 'CC ' 'LD ' 'AR ' 'DTBS' 'error:'; do printf '%-8s %s\n' "$k" "$(grep -cF "$k" /tmp/build.log 2>/dev/null || echo 0)"; done
+          echo "===== make errors ====="
+          grep -nE 'make.*\*\*\*' /tmp/build.log 2>/dev/null | tail -10 || echo "(none)"
+          echo "===== artifacts ====="
+          find "$WS/kernel_platform/out" -maxdepth 8 \( -name 'Image' -o -name 'vmlinux' -o -name '*.dtb' -o -name 'vendor_dlkm.img' \) 2>/dev/null | head -25 || echo "(none)"
+          echo "===== dist ====="
+          ls -la "$WS/kernel_platform/out/msm-waipio-waipio-consolidate/dist" 2>/dev/null | head -25 || echo "(no dist)"
+          echo "===== tail 15 ====="
+          tail -15 /tmp/build.log 2>/dev/null || true
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: waipio-build-log-v9
+          path: /tmp/build.log
+          if-no-files-found: warn
