@@ -1,4 +1,4 @@
-name: 6.12 lahaina Kleaf probe v15
+name: 6.12 lahaina Kleaf probe v16
 
 # 目的: 验证 KERNEL.PLATFORM.5.0 (6.12) 的 Kleaf/Bazel 体系能否在 GH runner 上跑通
 #   6.12 有官方完整 lahaina BSP (build.config.msm.lahaina / lahaina_perf.bzl / 102行模块清单 / 126 DTS)
@@ -33,7 +33,7 @@ jobs:
 
     env:
       MANIFEST_URL: https://git.codelinaro.org/clo/la/kernelplatform/manifest
-      MANIFEST_TAG: KERNEL.PLATFORM.5.0.r47-01200-kernel.0
+      MANIFEST_TAG: AU_LINUX_KERNEL.PLATFORM.5.0.R47.00.00.00.241.012
       MANIFEST_XML: AU_LINUX_KERNEL.PLATFORM.5.0.R47.00.00.00.241.012.xml
       KP: ${{ github.workspace }}/kp
       TARGET: ${{ github.event.inputs.target }}
@@ -144,6 +144,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: kleaf-612-dryrun-log
+          name: kleaf-612-dryrun-log-v16
           path: /tmp/dry.log
           if-no-files-found: warn
