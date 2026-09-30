@@ -1,0 +1,163 @@
+name: 5.10 waipio build probe v13
+
+# v12 结论: GKI 完整成功(Image+modules+Image.lz4+Module.symvers)
+#   vendor defconfig 全过, ABI 检查过, DTBO 编译过
+#   卡在: build.config.msm.common:244 mkdtboimg.py: command not found
+#   mkdtboimg.py 用于打包 dtbo.img, 来自 tools/libufdt
+#   v12 只绕过了一半(ufdt_apply_overlay), 没补 mkdtboimg.py
+#
+# v13: 从 AOSP 克隆整个 platform/system/libufdt 到 kernel_platform/tools/libufdt
+#      该仓库自带 utils/src/{mkdtboimg.py, ufdt_apply_overlay} 等全部工具
+#      该路径已在构建 PATH 中(kernel_platform/tools/libufdt/utils/src)
+
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        required: false
+        default: 'msm-kernel/build.config.msm.waipio'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    continue-on-error: true
+
+    env:
+      KERNEL_REPO: https://github.com/one899/android_kernel_oneplus_sm8450_5.10_martini
+      KERNEL_REF: oneplus/sm8450_b_16.0_oneplus_10_pro
+      COMMON_REPO: https://github.com/one899/android_kernel_common_oneplus_sm8450_5.10_martini
+      COMMON_REF: oneplus/sm8450_b_16.0_oneplus_10_pro
+      MODULES_REPO: https://github.com/one899/android_kernel_modules_and_devicetree_sm8450_5.10_martini
+      MODULES_REF: oneplus/sm8450_b_16.0_oneplus_10_pro
+      DTC_REPO: https://git.codelinaro.org/clo/la/kernel_platform/external/dtc.git
+      DTC_REF: KERNEL.PLATFORM.1.0.c27
+      LIBUFDT_REPO: https://android.googlesource.com/platform/system/libufdt
+      WS: ${{ github.workspace }}/ws
+      BUILD_CONFIG_PATH: ${{ github.event.inputs.config }}
+      HERMETIC_TOOLCHAIN: '0'
+      LTO: 'thin'
+
+    steps:
+      - name: Install deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-arm-linux-gnueabi gcc-aarch64-linux-gnu \
+            bison flex libssl-dev bc zip cpio kmod libelf-dev python3 pkg-config
+
+      - name: Fetch clang-r416183b
+        run: |
+          set -e
+          CLANG_OK=0
+          ARCH_BASE="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads"
+          mkdir -p /tmp/aosp
+          for BR in android-gs-raviole-5.10-android12-d1 android-gs-raviole-5.10-android12-qpr3 main; do
+            if curl -fL --retry 2 -m 900 -o /tmp/aosp/c.tar.gz "$ARCH_BASE/$BR/clang-r416183b.tar.gz" 2>/dev/null; then
+              SZ=$(stat -c%s /tmp/aosp/c.tar.gz 2>/dev/null || echo 0)
+              if [ "$SZ" -gt 1000000 ]; then
+                mkdir -p /tmp/aosp/x && tar -xzf /tmp/aosp/c.tar.gz -C /tmp/aosp/x
+                if [ -x /tmp/aosp/x/bin/clang ]; then echo "CLANG_ROOT=/tmp/aosp/x" >> $GITHUB_ENV; CLANG_OK=1; echo "OK from $BR"; break; fi
+              fi
+            fi
+          done
+          [ "$CLANG_OK" = "1" ] || { echo "CLANG_ROOT=SYSTEM" >> $GITHUB_ENV; echo "fallback"; }
+
+      - name: Clone sources + dtc + libufdt
+        run: |
+          set -e
+          mkdir -p "$WS/kernel_platform"
+          git clone --depth 1 -b "$KERNEL_REF"  "$KERNEL_REPO"  "$WS/kernel_platform/msm-kernel"
+          git clone --depth 1 -b "$COMMON_REF"  "$COMMON_REPO"  "$WS/kernel_platform/common"
+          git clone --depth 1 -b "$MODULES_REF" "$MODULES_REPO" /tmp/modules
+          cp -a /tmp/modules/kernel_platform/. "$WS/kernel_platform/" 2>/dev/null || true
+          [ -d /tmp/modules/vendor ] && cp -a /tmp/modules/vendor "$WS/vendor" || true
+          rm -rf /tmp/modules
+          git clone --depth 1 -b "$DTC_REF" "$DTC_REPO" "$WS/kernel_platform/external/dtc"
+
+          echo "--- 克隆 libufdt ---"
+          git clone --depth 1 "$LIBUFDT_REPO" /tmp/libufdt
+          mkdir -p "$WS/kernel_platform/tools"
+          cp -a /tmp/libufdt "$WS/kernel_platform/tools/libufdt"
+          rm -rf /tmp/libufdt
+          echo "libufdt 顶层:"; ls "$WS/kernel_platform/tools/libufdt" | head
+          echo ""
+          echo "--- 查找关键工具 ---"
+          find "$WS/kernel_platform/tools/libufdt" -name 'mkdtboimg.py' -o -name 'ufdt_apply_overlay' 2>/dev/null | head -10
+          D="$WS/kernel_platform/tools/libufdt/utils/src"
+          echo "utils/src 内容:"; ls "$D" 2>/dev/null | head -20 || echo "(目录不存在)"
+
+      - name: Ensure dtbo tools on PATH
+        run: |
+          set -e
+          SRC="$WS/kernel_platform/tools/libufdt/utils/src"
+          if [ ! -f "$SRC/mkdtboimg.py" ]; then
+            echo "utils/src 下没有 mkdtboimg.py, 全树搜索..."
+            F=$(find "$WS/kernel_platform/tools/libufdt" -name 'mkdtboimg.py' 2>/dev/null | head -1)
+            if [ -n "$F" ]; then
+              echo "找到: $F"
+              mkdir -p "$SRC"; cp "$F" "$SRC/"
+            fi
+          fi
+          if [ -f "$SRC/mkdtboimg.py" ]; then
+            chmod +x "$SRC/mkdtboimg.py" "$SRC"/ufdt_apply_overlay 2>/dev/null || true
+            echo "✓ mkdtboimg.py 就位"
+          else
+            echo "✗ 仍缺 mkdtboimg.py, 回退 pip"
+            pip install libufdt 2>/dev/null || true
+            F2=$(find / -name 'mkdtboimg.py' 2>/dev/null | head -1)
+            [ -n "$F2" ] && cp "$F2" "$SRC/" && chmod +x "$SRC/mkdtboimg.py" && echo "  pip 提供: $F2"
+          fi
+          export PATH="$SRC:$PATH"
+          echo "PATH 检查:"
+          command -v mkdtboimg.py && echo "  ✓ mkdtboimg.py 在 PATH" || echo "  ✗ 不在 PATH"
+          command -v ufdt_apply_overlay && echo "  ✓ ufdt_apply_overlay 在 PATH" || echo "  ✗ 不在 PATH"
+
+      - name: Stage clang + repair wrappers
+        run: |
+          set -e
+          D="$WS/kernel_platform/prebuilts-master/clang/host/linux-x86/clang-r416183b"
+          mkdir -p "$(dirname "$D")"; rm -rf "$D"
+          if [ "$CLANG_ROOT" != "SYSTEM" ]; then ln -sfn "$CLANG_ROOT" "$D"; else
+            mkdir -p "$D"
+            for t in clang clang++ ld.lld llvm-ar llvm-as llvm-nm llvm-objcopy llvm-objdump llvm-strip; do
+              p=$(command -v $t 2>/dev/null || true); [ -n "$p" ] && ln -sf "$p" "$D/$t"
+            done
+          fi
+          "$D/bin/clang" --version | head -1
+          WRAPDIR="$WS/kernel_platform/build/build-tools/path/linux-x86"
+          if [ ! -d "$WS/kernel_platform/prebuilts/build-tools/linux-x86/bin" ]; then
+            grep -rl 'prebuilts/build-tools' "$WRAPDIR" 2>/dev/null | while read -r f; do rm -f "$f"; done
+          fi
+
+      - name: Build
+        run: |
+          set -o pipefail
+          cd "$WS/kernel_platform"
+          export PATH="$WS/kernel_platform/tools/libufdt/utils/src:$PATH"
+          ( BUILD_CONFIG="$BUILD_CONFIG_PATH" build/build.sh -j$(nproc) 2>&1 ) | tee /tmp/build.log
+          echo "BUILD_EXIT=${PIPESTATUS[0]}"
+        continue-on-error: true
+
+      - name: Report
+        if: always()
+        run: |
+          echo "===== counts ====="
+          for k in 'CC ' 'LD ' 'AR ' 'DTBS' 'DTBO' 'error:' 'not found'; do printf '%-14s %s\n' "$k" "$(grep -cF "$k" /tmp/build.log 2>/dev/null || echo 0)"; done
+          echo "===== make errors / missing tools ====="
+          grep -nE 'make.*\*\*\*|command not found|No such file' /tmp/build.log 2>/dev/null | tail -12 || echo "(none)"
+          echo "===== 产物 ====="
+          find "$WS/kernel_platform/out" -maxdepth 8 \( -name 'Image' -o -name 'vmlinux' -o -name 'dtbo.img' -o -name 'vendor_dlkm.img' -o -name 'boot.img' -o -name 'Module.symvers' \) 2>/dev/null | head -30 || echo "(none)"
+          echo "===== .ko 数量 ====="
+          find "$WS/kernel_platform/out" -name '*.ko' 2>/dev/null | wc -l
+          echo "===== dist 目录 ====="
+          ls -la "$WS/kernel_platform/out/msm-waipio-waipio-consolidate/dist" 2>/dev/null | head -30 || echo "(no dist)"
+          echo "===== tail 20 ====="
+          tail -20 /tmp/build.log 2>/dev/null || true
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: waipio-build-log-v13
+          path: /tmp/build.log
+          if-no-files-found: warn
