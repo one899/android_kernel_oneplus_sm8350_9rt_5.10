@@ -1,106 +1,137 @@
-# techpack 未知 —— 结论（本轮定稿）
+# techpack 未知 —— 最终结论：**墙不存在**
 
-> 决定性未知：**5.10 的 lahaina techpack 是否存在。**
-> 方法：直接打 CodeLinaro (CAF) 的 GitLab API，用 200/404 做硬判据，不靠命名猜测。
+> 决定性未知：5.10 的 lahaina techpack 是否存在。
+> **答案：三大子系统全部存在，全部在 CodeLinaro (CAF) 公开可下。**
+> 计划文档里「techpack 是死路 / Phase 2 工期不可估 / 建议放弃」的结论**全部推翻**。
 
 ---
 
-## 结论一览
+## ① 最终结果
 
-| 子系统 | 5.10 + lahaina | 判据 |
+| 子系统 | 仓库（CodeLinaro） | 5.10 分支 | lahaina 证据 |
+| --- | --- | --- | --- |
+| **display** | `clo/la/platform/vendor/opensource/display-drivers` [id=**13664**] | `display-kernel.lnx.5.10.r11-rel` | `config/lahainadisp.conf`、`config/gki_lahainadisp.conf` |
+| **audio** | `clo/la/platform/vendor/qcom/opensource/audio-kernel-ar` [id=**22253**] | `audio-kernel.lnx.5.10.r6-rel` | `config/lahainaauto.conf` |
+| **camera** | `clo/la/platform/vendor/opensource/camera-kernel` [id=**13577**] | `CAMERA.LA.2.0.c26` | `config/lahaina.mk` |
+
+三条都有 200 的分支探测与目录列举佐证，不是推断。
+
+---
+
+## ② 为什么前几轮找不到（两个关键陷阱）
+
+### 陷阱一：audio 换了仓库
+
+我第一次查的是 `clo/la/platform/vendor/opensource/audio-kernel` [13492] —— 674 个分支里
+内核版本族只有 `4.19 / 5.15 / 6.0`，**没有 5.10**。
+
+**真正的位置是另一个仓库**：`clo/la/platform/vendor/qcom/opensource/audio-kernel-ar`（`-ar` = AudioReach）。
+224 个分支里有 10 个含 5.10（`.c3` / `.c4` / `.r1-rel` … `.r6-rel`）。
+
+**怎么发现的**：不是靠猜，是读 **manifest XML**——
+`AUDIO_IOT.LA.11.0.r2-06500-LAHAINA.0.xml` 里明确写着：
+
+```xml
+<project name="platform/vendor/qcom/opensource/audio-kernel-ar"
+         path="vendor/qcom/opensource/audio-kernel"
+         upstream="refs/heads/audio-kernel-iot.lnx.11.0.r5-rel" />
+```
+
+### 陷阱二：manifest 的 tag 命名**不可靠地**覆盖 lahaina
+
+这是本轮最重要的方法论教训。我差点据此下错结论。
+
+| manifest 仓库 | tag 总数 | 含 LAHAINA 的 tag |
 | --- | --- | --- |
-| **display** | ✅ **存在** | `display-kernel.lnx.5.10.r11-rel` 里有 `config/lahainadisp.conf`、`config/gki_lahainadisp.conf` |
-| **audio** | ❌ **未找到** | `audio-kernel` 的 674 个分支里，内核版本命名族只有 **4.19 / 5.15 / 6.0**，无 5.10 |
-| **camera** | ❌ **未找到** | `camera-kernel` 298 个分支，全量过滤 `*5.10*` = **0** |
+| `techpack/audio/manifest` | — | **18** |
+| `techpack/video/manifest` | 939 | **22** |
+| `techpack/display/manifest` | 862 | **0** ← 但 display **确实有** 5.10 lahaina 源 |
+| `techpack/camera/manifest` | 800+ | **0** |
+
+**display 的反例是关键**：它明明有 `display-kernel.lnx.5.10.r11-rel` + `config/lahainadisp.conf`，
+但它的 manifest 里一个 LAHAINA tag 都没有。
+
+⇒ **「manifest 里没有 LAHAINA tag」不等于「没有 5.10 lahaina 源」。**
+如果我拿 camera manifest 的 0 命中当结论，就会得出完全错误的答案。
+
+### 正确的方法（本轮最终用的）
+
+**用 5.10 的 SoC（waipio）去反推分支名。**
+
+waipio 的 camera manifest `CAMERA.LA.2.0.c26-00700-WAIPIO.0.xml` 写着：
+
+```xml
+<project name="clo/la/platform/vendor/opensource/camera-kernel"
+         upstream="CAMERA.LA.2.0.c26" />
+```
+
+⇒ 该分支就是 5.10 的 camera techpack。再去它里面找 lahaina →
+`config/lahaina.mk` ✓
 
 ---
 
-## ① 已确证：display 的 5.10 lahaina 源
+## ③ 顺带确立的两条硬事实
 
-**仓库**：`clo/la/platform/vendor/opensource/display-drivers`（project id **13664**）
-**分支**：`display-kernel.lnx.5.10.r11-rel`
-
-`config/` 实测 28 项，其中：
-
-```
-config/lahainadisp.conf
-config/lahainadispconf.h
-config/gki_lahainadisp.conf
-config/gki_lahainadispconf.h
-```
-
-与 `gki_waipiodisp.conf` / `gki_parrotdisp.conf` / `gki_neodisp.conf` /
-`gki_holidisp.conf` / `gki_ravelindisp.conf` / `gki_anorakdisp.conf` 并列。
-分支族里有 16 个含 `5.10` 的（`.r2-rel`…`.r11-rel`、`.c2`、`.2.c1`、`.2.r1-rel`、`.3.r1-rel`），
-另有 `lnx.5.15.10.c1` 佐证 `lnx.<内核版本>` 的命名含义。
-
----
-
-## ② 决定性判据：两套 train 命名互斥
-
-之前我一度把 `LA.UM.10.9.1` 当成 5.10（因为 `LA.UM.9.14.1` 是 5.4 的 lahaina train，数字更大）。
-**用分支探测直接证伪：**
+**A. 两套 release train 命名互斥（200/404 实测）**
 
 | 分支 | `clo/la/kernel/msm-5.10` | `clo/la/kernel/msm-5.4` |
 | --- | --- | --- |
-| `LA.UM.10.9.1.c25` | **404** | **200** |
-| `LA.UM.10.9.1.r1` | 404 | 200 |
-| `LA.UM.9.14.1.c25` | 404 | 200 |
+| `LA.UM.10.9.1.c25` | 404 | **200** |
+| `LA.UM.9.14.1.c25` | 404 | **200** |
 | `KERNEL.PLATFORM.1.0.c25` | **200** | 404 |
 
-（`msm-5.10` 共 1274 个分支；`msm-5.4` 同样规模。）
+⇒ `LA.UM.*` = 5.4 世代；`KERNEL.PLATFORM.*` = 5.10 世代。
+（`msm-5.10` 共 1274 分支、`msm-5.4` 同量级，已探测确认。）
 
-⇒ **`LA.UM.*` = msm-5.4 世代；`KERNEL.PLATFORM.*` = msm-5.10 世代。两套命名不交叉。**
+**⇒ 因此 `audio-kernel` / `camera-kernel` 在 `LA.UM.10.9.1.c25` 上的
+`config/lahainaauto.conf` / `config/lahainacamera.conf` 是 5.4 的，不能当 5.10 证据。**
+（我中途据此下过一次结论，已作废——这也是为什么必须用 train 归属来判，而不是看配置文件是否存在。）
 
-**推论**：`audio-kernel` / `camera-kernel` 在 `LA.UM.10.9.1.c25` 上的
-`config/lahainaauto.conf` / `config/lahainacamera.conf` 是 **5.4 的 techpack**，
-不能作为 5.10 的证据。**此前那条推断正式作废。**
+**B. 首批 manifest 仓库清单（可复用）**
 
----
-
-## ③ audio / camera 的 5.10 源在哪 —— 尚未找到
-
-已排除的：
-
-- `audio-kernel`：674 分支，含 5.10 = 0；内核版本族只有 `audio-kernel.lnx.4.19.*` / `.5.15.*` / `.6.0.*`
-- `camera-kernel`：298 分支，含 5.10 = 0；版本族是**驱动版本**（`1.0` / `3.1` / `3.2`…）不是内核版本
-- 两者都**没有** `KERNEL.PLATFORM.*` 分支
-- `clo/la/platform/vendor/qcom/opensource/github/audioreach/Audio-Kernel` → 分支数 0（可能需登录或已迁走）
-
-**下一步该查的**（按成本排序）：
-
-1. **在 CLO 全站找「带 `KERNEL.PLATFORM.*` 分支」的 audio/camera 仓库。**
-   display 用 `lnx.5.10`，audio/camera 可能用 `KERNEL.PLATFORM.*` 或已迁到新仓库。
-   方法：搜项目名含 audio/camera，逐个探 `KERNEL.PLATFORM.1.0.c25` 返回码。
-2. **查 CLO 的 manifest 仓库**，找 `KERNEL.PLATFORM.*` 那一版 release 的完整仓库清单，
-   清单里 audio/camera 的仓与分支就是答案。
-3. **反向锚定**：从 display 那条 `lnx.5.10.r11-rel` 出发，找同一 release 的兄弟仓。
+```
+clo/la/techpack/audio/manifest      [53544]
+clo/la/techpack/camera/manifest     [29587]
+clo/la/techpack/display/manifest    [29597]
+clo/la/techpack/video/manifest      [29596]
+clo/la/kernel/manifest              [41276]
+clo/la/kernelplatform/manifest      [29372]
+```
 
 ---
 
-## ④ 对计划文档的影响
+## ④ 对计划文档的影响（需同步）
 
-| 计划原文（v2） | 现在 |
+| 计划原文（v2） | 修正 |
 | --- | --- |
-| 「所有公开 OPLUS/OPPO 5.10 树的 techpack 都是 stub」 | **仍成立**（那是 OPLUS 侧）。但要补一句：**高通 CLO 侧 display 有 5.10 lahaina 源** |
-| 「techpack 是死路，不存在从 donor 借的可能」 | **部分推翻**：display 有解；audio / camera 仍未找到 |
-| 「Phase 2 工期不可估，建议放弃」 | **需重写**：display 可以借，audio/camera 未知。Phase 2 从「三大驱动栈全部自己前移」变成「display 借 + audio/camera 待定」 |
+| 「所有公开 OPLUS/OPPO 5.10 树的 techpack 都是 stub」 | 仍成立（OPLUS 侧）。但**高通 CLO 侧三大件齐全**，两条线要分开说 |
+| 「techpack 是死路，不存在从 donor 借的可能」 | **完全推翻** |
+| 「Phase 2 工期不可估，建议放弃」 | **推翻**。Phase 2 从「自己前移 1839 个文件 / 三大驱动栈」降为「取 CLO 对应分支 + 按 martini 硬件调参」 |
+| 「整件事从不可行变成 6 个月量级大工程」 | 现在这个判断才成立。**阻塞点已清除，剩下的是工程量问题，不是可行性问题** |
+
+**仍未解决的是 martini 的设备侧适配**（面板 / 充电 IC / 触控 IC / 相机 sensor 的机型参数），
+以及 msm-5.10 侧缺 lahaina 的 vendor defconfig（需自己写）。但这两件都是「工作」，不是「没料」。
 
 ---
 
 ## ⑤ 可复现命令
 
 ```bash
-# 分支是否存在（最硬的判据）
+# 1) 分支是否存在（最硬判据）
 curl -s -o /dev/null -w '%{http_code}\n' \
-  "https://git.codelinaro.org/api/v4/projects/<id>/repository/branches/LA.UM.10.9.1.c25"
+  "https://git.codelinaro.org/api/v4/projects/<id>/repository/branches/<branch>"
 
-# 列分支 / 列目录
-curl -s "https://git.codelinaro.org/api/v4/projects/<id>/repository/branches?per_page=100&page=1"
+# 2) 列 config 找 SoC（关键：看 .conf/.mk，不是看分支名）
 curl -s "https://git.codelinaro.org/api/v4/projects/<id>/repository/tree?ref=<br>&path=config&per_page=100"
 
-# 搜项目
-curl -s "https://git.codelinaro.org/api/v4/projects?search=audio-kernel&per_page=100&simple=true"
+# 3) 读 manifest XML（找 release 用的仓与分支）
+curl -s "https://git.codelinaro.org/api/v4/projects/29587/repository/files/<TAG>.xml/raw?ref=release"
+
+# 4) 搜项目 / 列 tag
+curl -s "https://git.codelinaro.org/api/v4/projects?search=<kw>&per_page=100&simple=true"
+curl -s "https://git.codelinaro.org/api/v4/projects/<id>/repository/tags?per_page=100&page=1"
 ```
 
-已知 project id：display-drivers=**13664**、audio-kernel=**13492**、camera-kernel=**13577**。
+**已确认的 project id**
+display-drivers=13664 · audio-kernel=13492 · **audio-kernel-ar=22253** · camera-kernel=13577 ·
+camera manifest=29587 · display manifest=29597 · video manifest=29596 · audio manifest=53544
